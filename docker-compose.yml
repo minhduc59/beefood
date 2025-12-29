@@ -1,0 +1,455 @@
+# =============================================================================
+# BeeFood Platform - Complete Docker Compose Configuration
+# =============================================================================
+# This file orchestrates all microservices and infrastructure components
+# Start order: Infrastructure -> Eureka -> Gateway -> Microservices
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # INFRASTRUCTURE LAYER
+  # ===========================================================================
+  
+  # ---------------------------------------------------------------------------
+  # PostgreSQL - Relational Database
+  # ---------------------------------------------------------------------------
+  # Purpose: Stores structured data for Users, Products, and Orders services
+  # Database-per-Service Pattern: Each service owns its own database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: beefood-postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_MULTIPLE_DATABASES: user_service_db,product_service_db,order_service_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # MongoDB - NoSQL Database
+  # ---------------------------------------------------------------------------
+  # Purpose: Stores flexible document data for Restaurants and Delivery services
+  # Use Case: Dynamic schemas (menus, delivery locations)
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7.0
+    container_name: beefood-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Redis - Cache Layer
+  # ---------------------------------------------------------------------------
+  # Purpose: High-performance caching for Products Service
+  # Use Case: Cache popular products, menus, search results
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: beefood-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Zookeeper - Kafka Coordination
+  # ---------------------------------------------------------------------------
+  # Purpose: Manages Kafka cluster metadata and coordination
+  # Required For: Kafka broker operation
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: beefood-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - beefood-network
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kafka - Event Streaming Platform
+  # ---------------------------------------------------------------------------
+  # Purpose: Asynchronous communication between microservices
+  # Use Case: Order events, delivery assignments, notifications
+  # Pattern: Event-Driven Architecture (EDA)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: beefood-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ===========================================================================
+  # SERVICE DISCOVERY & API GATEWAY LAYER
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Eureka Server - Service Discovery
+  # ---------------------------------------------------------------------------
+  # Purpose: Service registry and discovery for microservices
+  # Role: All microservices register here; Gateway queries for service locations
+  # Port: 8761
+  # ---------------------------------------------------------------------------
+  eureka-server:
+    build: ./discovery-service
+    container_name: eureka-server
+    ports:
+      - "8761:8761"
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8761/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # API Gateway - Single Entry Point
+  # ---------------------------------------------------------------------------
+  # Purpose: Routes all external requests to appropriate microservices
+  # Responsibilities:
+  #   - Request routing
+  #   - JWT authentication & authorization
+  #   - Rate limiting
+  #   - Load balancing
+  # Port: 8080 (External access point)
+  # ---------------------------------------------------------------------------
+  api-gateway:
+    build: ./api-gateway
+    container_name: api-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      eureka-server:
+        condition: service_healthy
+    environment:
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ===========================================================================
+  # MICROSERVICES LAYER
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # User Service - User Management & Authentication
+  # ---------------------------------------------------------------------------
+  # Purpose: Manages user profiles, roles, and authentication
+  # Database: PostgreSQL (user_service_db)
+  # Responsibilities:
+  #   - User registration and login
+  #   - JWT token generation and validation
+  #   - User profile CRUD operations
+  #   - Role-based access control
+  # Port: 8082
+  # Communication: REST API (synchronous)
+  # ---------------------------------------------------------------------------
+  user-service:
+    build: ./user-service
+    container_name: user-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/user_service_db
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin123
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8082/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Product Service - Product Catalog Management
+  # ---------------------------------------------------------------------------
+  # Purpose: Manages food & beverage inventory
+  # Database: PostgreSQL (product_service_db)
+  # Cache: Redis (for popular products)
+  # Responsibilities:
+  #   - Product CRUD operations
+  #   - Inventory management
+  #   - Product search and filtering
+  #   - Cache management with TTL
+  # Port: 8083
+  # Communication: REST API (read), Kafka (inventory updates)
+  # ---------------------------------------------------------------------------
+  product-service:
+    build: ./product-service
+    container_name: product-service
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/product_service_db
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin123
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Restaurant Service - Restaurant Management
+  # ---------------------------------------------------------------------------
+  # Purpose: Manages restaurant profiles and menus
+  # Database: MongoDB (restaurant_service_db)
+  # Responsibilities:
+  #   - Restaurant profile CRUD
+  #   - Menu management
+  #   - Operating hours and status
+  #   - Restaurant search and filtering
+  # Port: 8084
+  # Communication: REST API (synchronous)
+  # ---------------------------------------------------------------------------
+  restaurant-service:
+    build: ./restaurant-service
+    container_name: restaurant-service
+    ports:
+      - "8084:8084"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+    environment:
+      SPRING_DATA_MONGODB_URI: mongodb://admin:admin123@mongodb:27017/restaurant_service_db?authSource=admin
+      SPRING_DATA_MONGODB_DATABASE: restaurant_service_db
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8084/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Order Service - Order Processing & Payment (CORE SERVICE)
+  # ---------------------------------------------------------------------------
+  # Purpose: Order lifecycle management and payment processing
+  # Database: PostgreSQL (order_service_db)
+  # Responsibilities:
+  #   - Order creation and validation
+  #   - Payment processing
+  #   - Order status management
+  #   - Publish Kafka events (ORDER_CREATED, ORDER_CONFIRMED, ORDER_CANCELLED)
+  # Port: 8085
+  # Communication: REST API (create order), Kafka Producer (order events)
+  # State Machine: PENDING → CONFIRMED → PREPARING → READY → PICKED_UP → DELIVERED
+  # ---------------------------------------------------------------------------
+  order-service:
+    build: ./order-service
+    container_name: order-service
+    ports:
+      - "8085:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/order_service_db
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin123
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8085/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Delivery Service - Delivery Logistics
+  # ---------------------------------------------------------------------------
+  # Purpose: Manages delivery operations and driver assignments
+  # Database: MongoDB (delivery_service_db)
+  # Responsibilities:
+  #   - Consume ORDER_CONFIRMED events from Kafka
+  #   - Assign delivery drivers
+  #   - Track delivery status in real-time
+  #   - Update delivery location
+  # Port: 8086
+  # Communication: Kafka Consumer (order events), REST API (tracking)
+  # ---------------------------------------------------------------------------
+  delivery-service:
+    build: ./delivery-service
+    container_name: delivery-service
+    ports:
+      - "8086:8086"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      eureka-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_DATA_MONGODB_URI: mongodb://admin:admin123@mongodb:27017/delivery_service_db?authSource=admin
+      SPRING_DATA_MONGODB_DATABASE: delivery_service_db
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8086/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Notification Service - Multi-Channel Notifications
+  # ---------------------------------------------------------------------------
+  # Purpose: Sends notifications via email, SMS, and push notifications
+  # Responsibilities:
+  #   - Consume events from all services (Kafka)
+  #   - Send email/SMS/push notifications
+  #   - Log notification history
+  # Port: 8087
+  # Communication: Kafka Consumer (all domain events)
+  # Pattern: Fan-out (one event, multiple notifications)
+  # ---------------------------------------------------------------------------
+  notification-service:
+    build: ./notification-service
+    container_name: notification-service
+    ports:
+      - "8087:8087"
+    depends_on:
+      eureka-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_CLIENT_SERVICE_URL_DEFAULTZONE: http://eureka-server:8761/eureka/
+      SPRING_PROFILES_ACTIVE: docker
+    networks:
+      - beefood-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8087/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+# =============================================================================
+# PERSISTENT STORAGE
+# =============================================================================
+# Volumes ensure data persists across container restarts
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# =============================================================================
+# NETWORKING
+# =============================================================================
+# All services communicate through a bridge network
+# This allows services to reference each other by service name (e.g., "kafka:9092")
+# =============================================================================
+networks:
+  beefood-network:
+    driver: bridge
