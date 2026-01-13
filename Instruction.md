@@ -1264,6 +1264,39 @@ After successfully running the platform:
 6. **Deploy to Cloud:** Use Kubernetes for production deployment
 
 ---
+# BeeFood Local Development - Quick Reference
+
+## 🚀 Quick Start
+
+```bash
+# 1. Start infrastructure
+./scripts/run-services-locally.sh
+
+# 2. Open 8 terminal tabs and run these commands:
+
+# Tab 1: Discovery Service
+cd discovery-service && mvn spring-boot:run
+
+# Tab 2: API Gateway (wait for Tab 1 to finish starting)
+cd api-gateway && mvn spring-boot:run
+
+# Tab 3: User Service
+cd user-service && mvn spring-boot:run
+
+# Tab 4: Product Service
+cd product-service && mvn spring-boot:run
+
+# Tab 5: Restaurant Service
+cd restaurant-service && mvn spring-boot:run
+
+# Tab 6: Order Service
+cd order-service && mvn spring-boot:run
+
+# Tab 7: Delivery Service
+cd delivery-service && mvn spring-boot:run
+
+# Tab 8: Notification Service
+cd notification-service && mvn spring-boot:run 
 
 ## Additional Resources
 
